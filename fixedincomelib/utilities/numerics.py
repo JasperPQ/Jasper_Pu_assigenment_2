@@ -108,20 +108,66 @@ class Interpolator1DPCP(Interpolator1D):
         assert self.extrap_method_ == ExtrapMethod.FLAT
 
     def interpolate(self, x: float) -> float:
-        #TODO
-        pass
+        index = int(np.searchsorted(self.axis1_, x, side='left'))
+        index = min(index, self.length_ - 1)
+        return float(self.values_[index])
 
     def integrate(self, start_x: float, end_x: float) -> float:
-        #TODO
-        pass
+        if start_x == end_x:
+            return 0.0
+
+        lower = min(start_x, end_x)
+        upper = max(start_x, end_x)
+        weights = np.zeros(self.length_, dtype=float)
+
+        if self.length_ == 1:
+            weights[0] = upper - lower
+        else:
+            # The value at each knot is the value on the interval ending at
+            # that knot; the first and last values extend flat beyond the grid.
+            weights[0] = max(0.0, min(upper, self.axis1_[0]) - lower)
+            for index in range(1, self.length_ - 1):
+                weights[index] = max(
+                    0.0,
+                    min(upper, self.axis1_[index])
+                    - max(lower, self.axis1_[index - 1]),
+                )
+            weights[-1] = max(
+                0.0, upper - max(lower, self.axis1_[-2])
+            )
+
+        integral = float(np.dot(self.values_, weights))
+        return integral if end_x > start_x else -integral
 
     def gradient_wrt_ordinate(self, x: float) -> np.ndarray:
-        #TODO
-        pass
+        gradient = np.zeros(self.length_, dtype=float)
+        index = int(np.searchsorted(self.axis1_, x, side='left'))
+        gradient[min(index, self.length_ - 1)] = 1.0
+        return gradient
 
     def gradient_of_integrated_value_wrt_ordinate(self, start_x: float, end_x: float) -> np.ndarray:
-        #TODO
-        pass
+        if start_x == end_x:
+            return np.zeros(self.length_, dtype=float)
+
+        lower = min(start_x, end_x)
+        upper = max(start_x, end_x)
+        gradient = np.zeros(self.length_, dtype=float)
+
+        if self.length_ == 1:
+            gradient[0] = upper - lower
+        else:
+            gradient[0] = max(0.0, min(upper, self.axis1_[0]) - lower)
+            for index in range(1, self.length_ - 1):
+                gradient[index] = max(
+                    0.0,
+                    min(upper, self.axis1_[index])
+                    - max(lower, self.axis1_[index - 1]),
+                )
+            gradient[-1] = max(
+                0.0, upper - max(lower, self.axis1_[-2])
+            )
+
+        return gradient if end_x > start_x else -gradient
 
 
 class InterpolatorFactory:

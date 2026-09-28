@@ -96,7 +96,55 @@ class BondCalculator:
         n=[70/90, 70/90+1, ...]; at y=0.055, dirty=1030.4611,
         AI=3.3333, clean=1027.1278. Other accrual bases feed different
         accrual/time fractions into the same Street formulas above."""
-        #TODO
+        if settlement_date is not None:
+            settle = Date(settlement_date)
+        elif value_date is not None:
+            settle = self.settlement_date(value_date)
+        else:
+            raise ValueError('Provide either value_date or settlement_date.')
+        if yield_rate is None:
+            raise ValueError('yield_rate is required.')
+
+        remaining = [period for period in self.schedule if period['end_date'] > settle]
+        if not remaining:
+            raise ValueError('No cashflows remain after the settlement date.')
+
+        coupon_amounts = np.array([period['coupon'] for period in remaining], dtype=float)
+        time_increments = [self._periods_to_next_coupon(settle, remaining[0])]
+        time_increments.extend(
+            self._periods_to_next_coupon(period['start_date'], period)
+            for period in remaining[1:]
+        )
+        n = np.cumsum(np.asarray(time_increments, dtype=float))
+
+        y = float(yield_rate)
+        frequency = self.frequency
+        if len(remaining) == 1:
+            t = n / frequency
+            denominator = 1.0 + y * t
+            discount = 1.0 / denominator
+            discount_first = -t / denominator**2
+            discount_second = 2.0 * t**2 / denominator**3
+        else:
+            base = 1.0 + y / frequency
+            discount = base**(-n)
+            discount_first = -(n / frequency) * base**(-n - 1.0)
+            discount_second = (
+                n * (n + 1.0) / frequency**2 * base**(-n - 2.0)
+            )
+
+        principal = self.face_value * self.redemption
+        dirty = float(np.dot(coupon_amounts, discount) + principal * discount[-1])
+        first = float(
+            np.dot(coupon_amounts, discount_first)
+            + principal * discount_first[-1]
+        )
+        second = float(
+            np.dot(coupon_amounts, discount_second)
+            + principal * discount_second[-1]
+        )
+        ai = self._accrued_interest(settle)
+
         return {'clean_price': float(dirty - ai), 'dirty_price': float(dirty),
                 'accrued_interest': ai, 'dpricedyield': float(first),
                 'd2pricedyield2': float(second), 'settlement_date': settle.ISO()}
@@ -126,7 +174,78 @@ class BondCalculator:
         Example (6M, BACKWARD, ISMA-30/360): KSA's final dates are
         2054-02-03 -> 2054-08-03 -> 2055-01-21, so the last period is short.
         Payment rolling may move payment_date, but never these accrual dates."""
-        #TODO
+        first_regular_date = self.first_cpn_date
+        if first_regular_date is None or Date(first_regular_date) == Date(self.maturity_date):
+            first_regular_date = None
+
+        schedule_rule = self.conv['schedule rule'].upper()
+        periods_df = qfCreateSchedule(
+            start_date=self.first_acc_date,
+            end_date=self.maturity_date,
+            accrual_period=self.conv['coupon accrual period'],
+            holiday_convention='NONE',
+            business_day_convention='NONE',
+            accrual_basis='NONE',
+            rule=schedule_rule,
+            end_of_month=self.conv['end of month'],
+            payment_offset=self.conv['payment offset'],
+            payment_offset_business_day_convention=self.conv['payment business day convention'],
+            payment_offset_holiday_convention=self.conv['payment holiday convention'],
+            first_regular_date=first_regular_date,
+            next_to_last_date=self.conv['last regular coupon date'],
+        )
+
+        # qfCreateSchedule returns dates and payment dates, but not QuantLib's
+        # regular/stub flags. Rebuild the identical unadjusted schedule to get them.
+        rule = (ql.DateGeneration.Forward if schedule_rule == 'FORWARD'
+                else ql.DateGeneration.Backward)
+        ql_schedule = ql.Schedule(
+            Date(self.first_acc_date),
+            Date(self.maturity_date),
+            self.coupon_period,
+            HolidayConvention.new('NONE'),
+            BusinessDayConvention.new('NONE'),
+            BusinessDayConvention.new('NONE'),
+            rule,
+            self.conv['end of month'],
+            Date(first_regular_date),
+            Date(self.conv['last regular coupon date']),
+        )
+
+        periods = []
+        last_index = len(periods_df) - 1
+        for index, row in periods_df.iterrows():
+            start_date = Date(row['StartDate'])
+            end_date = Date(row['EndDate'])
+            payment_date = Date(row['PaymentDate'])
+            period_type = (
+                'first' if index == 0
+                else 'last' if index == last_index
+                else 'regular'
+            )
+            basis = {
+                'first': self.first_accrual_basis,
+                'last': self.last_accrual_basis,
+                'regular': self.accrual_basis,
+            }[period_type]
+
+            one_coupon_end = add_period(
+                start_date,
+                self.coupon_period,
+                BusinessDayConvention.new('NONE'),
+                HolidayConvention.new('NONE'),
+                self.conv['end of month'],
+            )
+            is_regular = bool(ql_schedule.isRegular(index + 1)) or one_coupon_end == end_date
+            periods.append({
+                'start_date': start_date,
+                'end_date': end_date,
+                'payment_date': payment_date,
+                'is_regular': is_regular,
+                'period_type': period_type,
+                'accrual_basis': basis,
+            })
+
         return periods
 
     def _first_period_accrual(self, period: Dict[str, Any]) -> float:
@@ -150,7 +269,57 @@ class BondCalculator:
         Bond Basis 30/360 example: META's count is 191, so
         coupon=100*0.0525*(191/360)=2.785417. ACT/360 and ACT/365 FIXED
         use actual days/360 or /365 through the same _year_fraction helper."""
-        #TODO
+        if period['is_regular']:
+            return self._regular_period_accrual(period)
+
+        start_date = period['start_date']
+        end_date = period['end_date']
+        basis = period['accrual_basis']
+
+        # The final quasi-coupon period is the reference period nearest to the
+        # first coupon date. Keep it on period; earlier reference periods are
+        # only needed locally when a long first coupon spans multiple periods.
+        ref_end = end_date
+        ref_start = add_period(
+            ref_end,
+            Period.negate_period(self.coupon_period),
+            BusinessDayConvention.new('NONE'),
+            HolidayConvention.new('NONE'),
+            self.conv['end of month'],
+        )
+        period['ref_start'] = ref_start
+        period['ref_end'] = ref_end
+
+        if basis.needs_reference_period:
+            full_accrual = 0.0
+            grid_start = ref_start
+            grid_end = ref_end
+
+            # Sum the portion of each quasi-coupon period covered by this
+            # first coupon, walking backward for long stubs.
+            while grid_end > start_date:
+                overlap_start = max(start_date, grid_start)
+                overlap_end = min(end_date, grid_end)
+                if overlap_start < overlap_end:
+                    full_accrual += self._year_fraction(
+                        overlap_start,
+                        overlap_end,
+                        basis,
+                        grid_start,
+                        grid_end,
+                    )
+                grid_end = grid_start
+                grid_start = add_period(
+                    grid_end,
+                    Period.negate_period(self.coupon_period),
+                    BusinessDayConvention.new('NONE'),
+                    HolidayConvention.new('NONE'),
+                    self.conv['end of month'],
+                )
+        else:
+            full_accrual = self._year_fraction(start_date, end_date, basis)
+
+        period['accrual'] = full_accrual
         return self.face_value * self.coupon_rate * full_accrual
 
     def _last_period_accrual(self, period: Dict[str, Any]) -> float:
@@ -174,7 +343,54 @@ class BondCalculator:
         ISMA-30/360 example: KSA, 2054-08-03 to 2055-01-21:
         coupon=100*0.0375*(168/360)=1.75. ACT/360 and ACT/365 FIXED
         use actual days/360 or /365 through the same _year_fraction helper."""
-        #TODO
+        if period['is_regular']:
+            return self._regular_period_accrual(period)
+
+        start_date = period['start_date']
+        end_date = period['end_date']
+        basis = period['accrual_basis']
+
+        ref_start = start_date
+        ref_end = add_period(
+            ref_start,
+            self.coupon_period,
+            BusinessDayConvention.new('NONE'),
+            HolidayConvention.new('NONE'),
+            self.conv['end of month'],
+        )
+        period['ref_start'] = ref_start
+        period['ref_end'] = ref_end
+
+        if basis.needs_reference_period:
+            full_accrual = 0.0
+            grid_start = ref_start
+            grid_end = ref_end
+
+            # A long final stub may cover multiple quasi-coupon periods;
+            # move the reference grid forward until it reaches maturity.
+            while grid_start < end_date:
+                overlap_start = max(start_date, grid_start)
+                overlap_end = min(end_date, grid_end)
+                if overlap_start < overlap_end:
+                    full_accrual += self._year_fraction(
+                        overlap_start,
+                        overlap_end,
+                        basis,
+                        grid_start,
+                        grid_end,
+                    )
+                grid_start = grid_end
+                grid_end = add_period(
+                    grid_start,
+                    self.coupon_period,
+                    BusinessDayConvention.new('NONE'),
+                    HolidayConvention.new('NONE'),
+                    self.conv['end of month'],
+                )
+        else:
+            full_accrual = self._year_fraction(start_date, end_date, basis)
+
+        period['accrual'] = full_accrual
         return self.face_value * self.coupon_rate * full_accrual
 
     def _regular_period_accrual(self, period: Dict[str, Any]) -> float:
@@ -189,7 +405,15 @@ class BondCalculator:
         coupon=1000*0.06/4=15. In this model, a regular coupon stays 15
         with other bases too; the saved year fraction changes with the basis
         and is used to calculate the earned share of that coupon."""
-        #TODO
+        period['ref_start'] = period['start_date']
+        period['ref_end'] = period['end_date']
+        period['accrual'] = self._year_fraction(
+            period['start_date'],
+            period['end_date'],
+            period['accrual_basis'],
+            period['ref_start'],
+            period['ref_end'],
+        )
         return self.face_value * self.coupon_rate / self.frequency
 
     def _accrued_interest(self, settlement_date: Date) -> float:
@@ -208,7 +432,21 @@ class BondCalculator:
         96 of 191 counted days elapsed => AI=2.785416667*96/191=1.40.
         ACT/360 or ACT/365 FIXED uses actual-day year fractions in this ratio.
         The coupon already includes face and frequency; do not apply them again."""
-        #TODO
+        period = next(
+            (p for p in self.schedule if p['end_date'] > settlement_date),
+            None,
+        )
+        if period is None:
+            return 0.0
+
+        elapsed = self._year_fraction(
+            period['start_date'],
+            settlement_date,
+            period['accrual_basis'],
+            period['ref_start'],
+            period['ref_end'],
+        )
+        return float(period['coupon'] * elapsed / period['accrual'])
         return period['coupon'] * ai_t / full_period_length
 
     def price_to_yield(self, value_date: Optional[str] = None, price: Optional[float] = None,
